@@ -8,21 +8,27 @@ from pickle import PicklingError
 
 import pytest
 
-from joblib import Parallel, delayed, numpy_pickle
+from joblib import Memory, Parallel, delayed, numpy_pickle
 from joblib._store_backends import (
     CacheWarning,
     FileSystemStoreBackend,
+    StoreBackendMixin,
     _old_split_id,
     concurrency_safe_write,
 )
 from joblib.backports import concurrency_safe_rename
-from joblib.test.common import with_multiprocessing
+from joblib.test.common import np, with_multiprocessing, with_numpy
 from joblib.testing import parametrize, raises, timeout, warns
 
 
 def write_func(output, filename):
     with open(filename, "wb") as f:
         cpickle.dump(output, f)
+
+
+def _gen():
+    # Keep the cache path short enough for Windows' default path limit.
+    return [np.arange(2**17), (i for i in range(3))]
 
 
 def load_func(expected, filename):
@@ -115,6 +121,137 @@ def test_warning_on_pickling_error(tmpdir):
 
     with pytest.warns(FutureWarning, match="not picklable"):
         backend.dump_item(("func", "input"), UnpicklableObject())
+
+
+@with_numpy
+@parametrize("compress", [0, 3, "gzip", "bz2", "xz"])
+def test_failed_memory_write_cleanup(tmp_path, compress):
+    cached = Memory(str(tmp_path), verbose=0, compress=compress).cache(_gen)
+    for _ in range(3):
+        with pytest.warns(CacheWarning, match="cannot pickle 'generator' object"):
+            result = cached()
+        np.testing.assert_array_equal(result[0], np.arange(2**17))
+        assert list(result[1]) == [0, 1, 2]
+        assert not cached.check_call_in_cache()
+        assert not list(tmp_path.rglob("output.pkl.*"))
+
+
+@parametrize("error_type", [RuntimeError, KeyboardInterrupt])
+@parametrize("existing_target", [False, True])
+def test_failed_local_write_cleanup(tmp_path, error_type, existing_target):
+    target = tmp_path / "output.pkl"
+    if existing_target:
+        target.write_bytes(b"original")
+    error = error_type("write failed")
+
+    def failing_write(value, filename):
+        with open(filename, "wb") as f:
+            f.write(value)
+        raise error
+
+    with pytest.raises(error_type) as exc:
+        FileSystemStoreBackend()._concurrency_safe_write(
+            b"partial output", str(target), failing_write
+        )
+    assert exc.value is error
+    assert not list(tmp_path.glob("output.pkl.*"))
+    if existing_target:
+        assert target.read_bytes() == b"original"
+    else:
+        assert not target.exists()
+
+
+@parametrize("error_type", [RuntimeError, KeyboardInterrupt])
+def test_local_write_failure_before_open(tmp_path, error_type):
+    error = error_type("open failed")
+
+    def failing_write(value, filename):
+        raise error
+
+    with pytest.raises(error_type) as exc:
+        FileSystemStoreBackend()._concurrency_safe_write(
+            b"value", str(tmp_path / "output.pkl"), failing_write
+        )
+    assert exc.value is error
+    assert not list(tmp_path.iterdir())
+
+
+@parametrize("existing_target", [False, True])
+def test_failed_local_move_cleanup(tmp_path, monkeypatch, existing_target):
+    backend = FileSystemStoreBackend()
+    target = tmp_path / "output.pkl"
+    if existing_target:
+        target.write_bytes(b"original")
+    error = PermissionError("rename failed")
+
+    def failing_move(source, destination):
+        with open(source, "rb") as f:
+            assert cpickle.load(f) == "replacement"
+        assert destination == str(target)
+        raise error
+
+    monkeypatch.setattr(backend, "_move_item", failing_move)
+    with pytest.raises(PermissionError) as exc:
+        backend._concurrency_safe_write("replacement", str(target), write_func)
+    assert exc.value is error
+    assert not list(tmp_path.glob("output.pkl.*"))
+    if existing_target:
+        assert target.read_bytes() == b"original"
+    else:
+        assert not target.exists()
+
+
+@parametrize("error_type", [RuntimeError, KeyboardInterrupt])
+def test_local_cleanup_preserves_error(tmp_path, monkeypatch, error_type):
+    error = error_type("write failed")
+
+    def failing_write(value, filename):
+        with open(filename, "wb") as f:
+            f.write(value)
+        raise error
+
+    def failing_unlink(filename):
+        raise PermissionError("cleanup failed")
+
+    with monkeypatch.context() as m:
+        m.setattr(os, "unlink", failing_unlink)
+        with pytest.raises(error_type) as exc:
+            FileSystemStoreBackend()._concurrency_safe_write(
+                b"partial output", str(tmp_path / "output.pkl"), failing_write
+            )
+    assert exc.value is error
+
+
+@parametrize("existing_target", [False, True])
+def test_successful_local_write(tmp_path, existing_target):
+    target = tmp_path / "output.pkl"
+    if existing_target:
+        target.write_bytes(b"original")
+    FileSystemStoreBackend()._concurrency_safe_write(
+        "replacement", str(target), write_func
+    )
+    with target.open("rb") as f:
+        assert cpickle.load(f) == "replacement"
+    assert not list(tmp_path.glob("output.pkl.*"))
+
+
+def test_virtual_backend_write_failure(monkeypatch):
+    class VirtualBackend(StoreBackendMixin):
+        def _move_item(self, source, destination):
+            raise AssertionError("an incomplete write must not be moved")
+
+    error = RuntimeError("remote write failed")
+
+    def failing_write(value, filename):
+        raise error
+
+    def unexpected_unlink(filename):
+        raise AssertionError("a virtual backend must not unlink a local file")
+
+    monkeypatch.setattr(os, "unlink", unexpected_unlink)
+    with pytest.raises(RuntimeError) as exc:
+        VirtualBackend()._concurrency_safe_write("value", "remote-key", failing_write)
+    assert exc.value is error
 
 
 def test_cache_tree_versions(tmpdir):

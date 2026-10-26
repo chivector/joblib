@@ -13,6 +13,7 @@ import types
 import uuid
 import warnings
 from abc import ABCMeta, abstractmethod
+from contextlib import suppress
 from pickle import PicklingError
 
 from . import numpy_pickle
@@ -498,6 +499,24 @@ class FileSystemStoreBackend(StoreBackendBase, StoreBackendMixin):
     _open_item = staticmethod(open)
     _item_exists = staticmethod(os.path.exists)
     _move_item = staticmethod(concurrency_safe_rename)
+
+    def _concurrency_safe_write(self, to_write, filename, write_func):
+        temporary_filename = None
+
+        def write(value, temporary_path):
+            nonlocal temporary_filename
+            temporary_filename = temporary_path
+            write_func(value, temporary_path)
+
+        try:
+            super()._concurrency_safe_write(to_write, filename, write)
+        except BaseException:
+            # Only the filesystem backend can unlink these temporary files.
+            # Keep the original write or rename error if cleanup also fails.
+            if temporary_filename is not None:
+                with suppress(OSError):
+                    os.unlink(temporary_filename)
+            raise
 
     def clear_location(self, location):
         """Delete location on store."""
