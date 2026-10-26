@@ -126,6 +126,8 @@ def test_warning_on_pickling_error(tmpdir):
 @with_numpy
 @parametrize("compress", [0, 3, "gzip", "bz2", "xz"])
 def test_failed_memory_write_cleanup(tmp_path, compress):
+    if compress == "xz":
+        pytest.importorskip("lzma")
     cached = Memory(str(tmp_path), verbose=0, compress=compress).cache(_gen)
     for _ in range(3):
         with pytest.warns(CacheWarning, match="cannot pickle 'generator' object"):
